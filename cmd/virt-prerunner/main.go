@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -27,19 +28,30 @@ import (
 )
 
 func main() {
-	vmJSON, err := base64.StdEncoding.DecodeString(os.Args[1])
+	var vmJSON string
+	var receiveMigration bool
+	flag.StringVar(&vmJSON, "vm-json", vmJSON, "Base64 encoded VM json")
+	flag.BoolVar(&receiveMigration, "receive-migration", receiveMigration, "Receive migration instead of starting a new VM")
+	flag.Parse()
+
+	decodedVMJSON, err := base64.StdEncoding.DecodeString(vmJSON)
 	if err != nil {
 		log.Fatalf("Failed to decode VM JSON: %s", err)
 	}
 
 	var vm virtv1alpha1.VirtualMachine
-	if err := json.Unmarshal(vmJSON, &vm); err != nil {
+	if err := json.Unmarshal(decodedVMJSON, &vm); err != nil {
 		log.Fatalf("Failed to unmarshal VM: %s", err)
 	}
 
 	vmConfig, err := buildVMConfig(context.Background(), &vm)
 	if err != nil {
 		log.Fatalf("Failed to build VM config: %s", err)
+	}
+	if receiveMigration {
+		cloudHypervisorCmd := []string{"cloud-hypervisor", "--api-socket", "/var/run/virtink/ch.sock"}
+		fmt.Println(strings.Join(cloudHypervisorCmd, " "))
+		return
 	}
 
 	cloudHypervisorCmd := []string{"cloud-hypervisor", "--api-socket", "/var/run/virtink/ch.sock", "--console", "pty", "--serial", "tty"}

@@ -2,27 +2,40 @@ package daemon
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
+	"path/filepath"
 	"reflect"
+	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	virtv1alpha1 "github.com/smartxworks/virtink/pkg/apis/virt/v1alpha1"
 	"github.com/smartxworks/virtink/pkg/cloudhypervisor"
+	"github.com/smartxworks/virtink/pkg/tlsutil"
 )
 
 type VMReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
+	Log      logr.Logger
 
 	NodeName string
+	NodeIP   string
+	RelayProvider
+
+	migrationControlBlocks map[types.UID]migrationControlBlock
+	mutex                  sync.Mutex
 }
 
 // +kubebuilder:rbac:groups=virt.virtink.smartx.com,resources=virtualmachines,verbs=get;list;watch;create;update;patch;delete
@@ -55,7 +68,9 @@ func (r *VMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 }
 
 func (r *VMReconciler) reconcile(ctx context.Context, vm *virtv1alpha1.VirtualMachine) error {
-	if vm.Status.NodeName == "" || vm.Status.NodeName != r.NodeName {
+	shouldReconcile := vm.Status.NodeName != "" && vm.Status.NodeName == r.NodeName ||
+		vm.Status.Migration != nil && vm.Status.Migration.TargetNodeName != "" && vm.Status.Migration.TargetNodeName == r.NodeName
+	if !shouldReconcile {
 		return nil
 	}
 
@@ -75,80 +90,230 @@ func (r *VMReconciler) reconcile(ctx context.Context, vm *virtv1alpha1.VirtualMa
 			vm.Status.Phase = virtv1alpha1.VirtualMachineRunning
 		}
 	case virtv1alpha1.VirtualMachineRunning:
-		vmInfo, err := r.getCloudHypervisorClient(vm).VmInfo(ctx)
-		if err != nil {
-			// TODO: ignore VM not found error
-			return fmt.Errorf("get VM info: %s", err)
-		}
+		if vm.Status.Migration == nil {
+			if vm.Status.NodeName != r.NodeName {
+				return nil
+			}
+			vmInfo, err := r.getCloudHypervisorClient(vm).VmInfo(ctx)
+			if err != nil {
+				// TODO: ignore VM not found error
+				return fmt.Errorf("get VM info: %s", err)
+			}
 
-		if vmInfo.State == "Running" || vmInfo.State == "Paused" {
-			if vm.Spec.RunPolicy == virtv1alpha1.RunPolicyHalted {
-				// TODO: shutdown with graceful timeout
-				if err := r.getCloudHypervisorClient(vm).VmShutdown(ctx); err != nil {
-					r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedPowerOff", "Failed to powered off VM")
-					return fmt.Errorf("power off VM: %s", err)
-				}
-			} else {
-				switch vm.Status.PowerAction {
-				case virtv1alpha1.VirtualMachinePowerOff:
+			if vmInfo.State == "Running" || vmInfo.State == "Paused" {
+				if vm.Spec.RunPolicy == virtv1alpha1.RunPolicyHalted {
+					// TODO: shutdown with graceful timeout
 					if err := r.getCloudHypervisorClient(vm).VmShutdown(ctx); err != nil {
 						r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedPowerOff", "Failed to powered off VM")
-					} else {
-						r.Recorder.Eventf(vm, corev1.EventTypeNormal, "PoweredOff", "Powered off VM")
+						return fmt.Errorf("power off VM: %s", err)
 					}
-				case virtv1alpha1.VirtualMachineShutdown:
-					if err := r.getCloudHypervisorClient(vm).VmPowerButton(ctx); err != nil {
-						r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedShutdown", "Failed to shutdown VM")
-					} else {
-						r.Recorder.Eventf(vm, corev1.EventTypeNormal, "Shutdown", "Shutdown VM")
+				} else {
+					switch vm.Status.PowerAction {
+					case virtv1alpha1.VirtualMachinePowerOff:
+						if err := r.getCloudHypervisorClient(vm).VmShutdown(ctx); err != nil {
+							r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedPowerOff", "Failed to powered off VM")
+						} else {
+							r.Recorder.Eventf(vm, corev1.EventTypeNormal, "PoweredOff", "Powered off VM")
+						}
+					case virtv1alpha1.VirtualMachineShutdown:
+						if err := r.getCloudHypervisorClient(vm).VmPowerButton(ctx); err != nil {
+							r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedShutdown", "Failed to shutdown VM")
+						} else {
+							r.Recorder.Eventf(vm, corev1.EventTypeNormal, "Shutdown", "Shutdown VM")
+						}
+					case virtv1alpha1.VirtualMachineReset:
+						if err := r.getCloudHypervisorClient(vm).VmReboot(ctx); err != nil {
+							r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedReset", "Failed to reset VM")
+						} else {
+							r.Recorder.Eventf(vm, corev1.EventTypeNormal, "Reset", "Reset VM")
+						}
+					case virtv1alpha1.VirtualMachineReboot:
+						// TODO: reboot
+						if err := r.getCloudHypervisorClient(vm).VmReboot(ctx); err != nil {
+							r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedReboot", "Failed to reboot VM")
+						} else {
+							r.Recorder.Eventf(vm, corev1.EventTypeNormal, "Rebooted", "Rebooted VM")
+						}
+					case virtv1alpha1.VirtualMachinePause:
+						if err := r.getCloudHypervisorClient(vm).VmPause(ctx); err != nil {
+							r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedPause", "Failed to pause VM")
+						} else {
+							r.Recorder.Eventf(vm, corev1.EventTypeNormal, "Paused", "Paused VM")
+						}
+					case virtv1alpha1.VirtualMachineResume:
+						if err := r.getCloudHypervisorClient(vm).VmResume(ctx); err != nil {
+							r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedResume", "Failed to resume VM")
+						} else {
+							r.Recorder.Eventf(vm, corev1.EventTypeNormal, "Resumed", "Resumed VM")
+						}
+					default:
+						// ignored
 					}
-				case virtv1alpha1.VirtualMachineReset:
-					if err := r.getCloudHypervisorClient(vm).VmReboot(ctx); err != nil {
-						r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedReset", "Failed to reset VM")
-					} else {
-						r.Recorder.Eventf(vm, corev1.EventTypeNormal, "Reset", "Reset VM")
-					}
-				case virtv1alpha1.VirtualMachineReboot:
-					// TODO: reboot
-					if err := r.getCloudHypervisorClient(vm).VmReboot(ctx); err != nil {
-						r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedReboot", "Failed to reboot VM")
-					} else {
-						r.Recorder.Eventf(vm, corev1.EventTypeNormal, "Rebooted", "Rebooted VM")
-					}
-				case virtv1alpha1.VirtualMachinePause:
-					if err := r.getCloudHypervisorClient(vm).VmPause(ctx); err != nil {
-						r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedPause", "Failed to pause VM")
-					} else {
-						r.Recorder.Eventf(vm, corev1.EventTypeNormal, "Paused", "Paused VM")
-					}
-				case virtv1alpha1.VirtualMachineResume:
-					if err := r.getCloudHypervisorClient(vm).VmResume(ctx); err != nil {
-						r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedResume", "Failed to resume VM")
-					} else {
-						r.Recorder.Eventf(vm, corev1.EventTypeNormal, "Resumed", "Resumed VM")
-					}
-				default:
-					// ignored
-				}
 
-				vm.Status.PowerAction = ""
+					vm.Status.PowerAction = ""
+				}
+			} else {
+				vm.Status.Phase = virtv1alpha1.VirtualMachineSucceeded
 			}
 		} else {
-			vm.Status.Phase = virtv1alpha1.VirtualMachineSucceeded
+			r.mutex.Lock()
+			defer r.mutex.Unlock()
+			migrationControlBlock := r.migrationControlBlocks[vm.UID]
+
+			var daemonCertDirPath = "/var/lib/virtink/daemon/cert"
+			switch vm.Status.Migration.Phase {
+			case virtv1alpha1.VirtualMachineMigrationScheduled:
+				if vm.Status.Migration.TargetNodeName == r.NodeName {
+					ctx, cancel := context.WithCancel(context.Background())
+					migrationControlBlock.ReceiveDomainCancelFunc = cancel
+
+					go func() {
+						if err := r.getMigrationTargetCloudHypervisorClient(vm).VmReceiveMigration(ctx, &cloudhypervisor.ReceiveMigrationData{
+							ReceiverUrl: "unix:/var/run/virtink/receive-migration.sock",
+						}); err != nil {
+							// TODO handle receive migration error
+							r.Log.Error(err, "receive migration")
+						}
+					}()
+
+					clientCACertPool, err := tlsutil.LoadCACert(daemonCertDirPath)
+					if err != nil {
+						return fmt.Errorf("load CA cert: %s", err)
+					}
+					tlsConfig := &tls.Config{
+						GetCertificate: func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+							return tlsutil.LoadCert(daemonCertDirPath)
+						},
+						ClientAuth: tls.RequireAndVerifyClientCert,
+						ClientCAs:  clientCACertPool,
+					}
+
+					port, err := r.RelayTCPToSocket(ctx, "0.0.0.0:0", tlsConfig, filepath.Join(getMigrationTargetVMSocketDirPath(vm), "receive-migration.sock"))
+					if err != nil {
+						return fmt.Errorf("start target relay: %s", err)
+					}
+
+					vm.Status.Migration.TargetPort = port
+					vm.Status.Migration.TargetNodeIP = r.NodeIP
+					vm.Status.Migration.Phase = virtv1alpha1.VirtualMachineMigrationTargetReady
+				}
+			case virtv1alpha1.VirtualMachineMigrationTargetReady:
+				if vm.Status.NodeName == r.NodeName {
+					ctx, cancel := context.WithCancel(context.Background())
+					migrationControlBlock.SendDomainCancelFunc = cancel
+
+					tlsConfig := &tls.Config{
+						InsecureSkipVerify: true,
+						GetClientCertificate: func(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+							return tlsutil.LoadCert(daemonCertDirPath)
+						},
+					}
+					if err := r.RelaySocketToTCP(ctx, filepath.Join(getVMSocketDirPath(vm), "send-migration.sock"), fmt.Sprintf("%s:%d", vm.Status.Migration.TargetNodeIP, vm.Status.Migration.TargetPort), tlsConfig); err != nil {
+						return fmt.Errorf("start source relay: %s", err)
+					}
+
+					sendMigrationErrChan := make(chan error, 1)
+					go func() {
+						if err := r.getCloudHypervisorClient(vm).VmSendMigration(ctx, &cloudhypervisor.SendMigrationData{
+							DestinationUrl: "unix:/var/run/virtink/send-migration.sock",
+						}); err != nil {
+							sendMigrationErrChan <- err
+						}
+					}()
+					migrationControlBlock.SendDomainErrCh = sendMigrationErrChan
+					vm.Status.Migration.Phase = virtv1alpha1.VirtualMachineMigrationRunning
+				}
+			case virtv1alpha1.VirtualMachineMigrationRunning:
+				if vm.Status.NodeName == r.NodeName {
+					var vmPod corev1.Pod
+					vmPodKey := types.NamespacedName{
+						Name:      vm.Status.VMPodName,
+						Namespace: vm.Namespace,
+					}
+					if err := r.Get(ctx, vmPodKey, &vmPod); err != nil {
+						return fmt.Errorf("get VM Pod: %s", err)
+					}
+
+					if vmPod.Status.Phase == corev1.PodSucceeded {
+						vm.Status.Migration.Phase = virtv1alpha1.VirtualMachineMigrationSent
+					} else if migrationControlBlock.SendDomainErrCh == nil {
+						vm.Status.Migration.Phase = virtv1alpha1.VirtualMachineMigrationFailed
+					} else {
+						select {
+						case err := <-migrationControlBlock.SendDomainErrCh:
+							if err != nil {
+								r.Recorder.Eventf(vm, corev1.EventTypeWarning, "FailedMigrate", "Failed to migrate VM to %s: %s", vm.Status.Migration.TargetNodeName, err)
+								vm.Status.Migration.Phase = virtv1alpha1.VirtualMachineMigrationFailed
+							}
+						default:
+							return errors.New("VM is migrating")
+						}
+					}
+					if sendDomainCancelFunc := migrationControlBlock.SendDomainCancelFunc; sendDomainCancelFunc != nil {
+						sendDomainCancelFunc()
+					}
+				}
+			case virtv1alpha1.VirtualMachineMigrationSent:
+				if vm.Status.Migration.TargetNodeName == r.NodeName {
+					// TODO handle VmNotCreated error
+					vmInfo, err := r.getMigrationTargetCloudHypervisorClient(vm).VmInfo(ctx)
+					if err != nil {
+						return err
+					}
+					switch vmInfo.State {
+					case "Running":
+						vm.Status.Migration.Phase = virtv1alpha1.VirtualMachineMigrationSucceeded
+						vm.Status.NodeName = vm.Status.Migration.TargetNodeName
+						vm.Status.VMPodName = vm.Status.Migration.TargetVMPodName
+						vm.Status.VMPodUID = vm.Status.Migration.TargetVMPodUID
+					default:
+						return errors.New("VM is migrating")
+					}
+
+					if receiveDomainCancelFunc := migrationControlBlock.ReceiveDomainCancelFunc; receiveDomainCancelFunc != nil {
+						receiveDomainCancelFunc()
+					}
+				}
+			}
+			r.migrationControlBlocks[vm.UID] = migrationControlBlock
+			// TODO cleanup migrationControlBlock
 		}
-	default:
-		// ignored
 	}
 	return nil
 }
 
 func (r *VMReconciler) getCloudHypervisorClient(vm *virtv1alpha1.VirtualMachine) *cloudhypervisor.Client {
-	return cloudhypervisor.NewClient(fmt.Sprintf("/var/lib/kubelet/pods/%s/volumes/kubernetes.io~empty-dir/virtink/ch.sock", string(vm.Status.VMPodUID)))
+	return cloudhypervisor.NewClient(filepath.Join(getVMSocketDirPath(vm), "ch.sock"))
+}
+
+func getVMSocketDirPath(vm *virtv1alpha1.VirtualMachine) string {
+	return filepath.Join("/pods", string(vm.Status.VMPodUID), "volumes/kubernetes.io~empty-dir/virtink/")
+}
+
+func (r *VMReconciler) getMigrationTargetCloudHypervisorClient(vm *virtv1alpha1.VirtualMachine) *cloudhypervisor.Client {
+	return cloudhypervisor.NewClient(filepath.Join(getMigrationTargetVMSocketDirPath(vm), "ch.sock"))
+}
+func getMigrationTargetVMSocketDirPath(vm *virtv1alpha1.VirtualMachine) string {
+	return filepath.Join("/pods", string(vm.Status.Migration.TargetVMPodUID), "volumes/kubernetes.io~empty-dir/virtink/")
 }
 
 func (r *VMReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.migrationControlBlocks = map[types.UID]migrationControlBlock{}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&virtv1alpha1.VirtualMachine{}).
 		Owns(&corev1.Pod{}).
 		Complete(r)
+}
+
+//go:generate mockgen -destination=mock/relay_provider.go -package=mock . RelayProvider
+
+type RelayProvider interface {
+	RelaySocketToTCP(ctx context.Context, socketPath string, tcpAddr string, tlsConfig *tls.Config) error
+	RelayTCPToSocket(ctx context.Context, tcpAddr string, tlsConfig *tls.Config, socketPath string) (int, error)
+}
+
+type migrationControlBlock struct {
+	SendDomainErrCh         <-chan error
+	SendDomainCancelFunc    context.CancelFunc
+	ReceiveDomainCancelFunc context.CancelFunc
 }

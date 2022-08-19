@@ -1385,6 +1385,40 @@ spec:
           status:
             description: VirtualMachineStatus is the status for a VirtualMachine resource
             properties:
+              migration:
+                properties:
+                  phase:
+                    enum:
+                    - Pending
+                    - Scheduling
+                    - Scheduled
+                    - TargetReady
+                    - Running
+                    - Sent
+                    - Succeeded
+                    - Failed
+                    type: string
+                  targetNodeIP:
+                    type: string
+                  targetNodeName:
+                    type: string
+                  targetPort:
+                    type: integer
+                  targetVMPodName:
+                    type: string
+                  targetVMPodUID:
+                    description: UID is a type that holds unique ID values, including
+                      UUIDs.  Because we don't ONLY use UUIDs, this is an alias to
+                      string.  Being a type captures intent and helps make sure that
+                      UIDs and names do not get conflated.
+                    type: string
+                  uid:
+                    description: UID is a type that holds unique ID values, including
+                      UUIDs.  Because we don't ONLY use UUIDs, this is an alias to
+                      string.  Being a type captures intent and helps make sure that
+                      UIDs and names do not get conflated.
+                    type: string
+                type: object
               nodeName:
                 type: string
               phase:
