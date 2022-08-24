@@ -11,6 +11,7 @@ import (
 	netv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -168,6 +169,11 @@ func (r *VMReconciler) reconcile(ctx context.Context, vm *virtv1alpha1.VirtualMa
 		if vm.Status.Phase != virtv1alpha1.VirtualMachineRunning {
 			return nil
 		}
+
+		if err := r.reconcileVMMigratableConditions(ctx, vm); err != nil {
+			return err
+		}
+
 		if vm.Status.Migration != nil {
 			switch vm.Status.Migration.Phase {
 			case "", virtv1alpha1.VirtualMachineMigrationPending:
@@ -594,6 +600,77 @@ func (r *VMReconciler) buildMigrationVMPod(ctx context.Context, vm *virtv1alpha1
 		TopologyKey: "kubernetes.io/hostname",
 	})
 	return pod, nil
+}
+
+func (r *VMReconciler) reconcileVMMigratableConditions(ctx context.Context, vm *virtv1alpha1.VirtualMachine) error {
+	if meta.FindStatusCondition(vm.Status.Conditions, string(virtv1alpha1.VirtualMachineMigratable)) == nil {
+		migratableCondition, err := r.calculateMigratableCondition(ctx, vm)
+		if err != nil {
+			return err
+		}
+		meta.SetStatusCondition(&vm.Status.Conditions, *migratableCondition)
+	}
+	return nil
+}
+
+func (r *VMReconciler) calculateMigratableCondition(ctx context.Context, vm *virtv1alpha1.VirtualMachine) (*metav1.Condition, error) {
+	if vm.Spec.Instance.CPU.DedicatedCPUPlacement {
+		return &metav1.Condition{
+			Type:    string(virtv1alpha1.VirtualMachineMigratable),
+			Status:  metav1.ConditionFalse,
+			Reason:  "CPUNotMigratable",
+			Message: "cannot migrate VM with dedicated CPU",
+		}, nil
+	}
+
+	for _, network := range vm.Spec.Networks {
+		for _, iface := range vm.Spec.Instance.Interfaces {
+			if iface.Name != network.Name {
+				continue
+			}
+			if network.Pod != nil && iface.Bridge != nil {
+				return &metav1.Condition{
+					Type:    string(virtv1alpha1.VirtualMachineMigratable),
+					Status:  metav1.ConditionFalse,
+					Reason:  "InterfaceNotMigratable",
+					Message: "cannot migrate VM which bridge to pod network",
+				}, nil
+			}
+			if iface.SRIOV != nil {
+				return &metav1.Condition{
+					Type:    string(virtv1alpha1.VirtualMachineMigratable),
+					Status:  metav1.ConditionFalse,
+					Reason:  "InterfaceNotMigratable",
+					Message: "cannot migrate VM with SRIOV interface device",
+				}, nil
+			}
+		}
+	}
+
+	for _, volume := range vm.Spec.Volumes {
+		if volume.ContainerRootfs != nil {
+			return &metav1.Condition{
+				Type:    string(virtv1alpha1.VirtualMachineMigratable),
+				Status:  metav1.ConditionFalse,
+				Reason:  "VolumeNotMigratable",
+				Message: "cannot migrate VM with containerRootfs volume ",
+			}, nil
+		}
+		if volume.ContainerDisk != nil {
+			return &metav1.Condition{
+				Type:    string(virtv1alpha1.VirtualMachineMigratable),
+				Status:  metav1.ConditionFalse,
+				Reason:  "VolumeNotMigratable",
+				Message: "cannot migrate VM with containerDisk volume ",
+			}, nil
+		}
+	}
+
+	return &metav1.Condition{
+		Type:   string(virtv1alpha1.VirtualMachineMigratable),
+		Status: metav1.ConditionTrue,
+		Reason: "Migratable",
+	}, nil
 }
 
 func (r *VMReconciler) gcVMPods(ctx context.Context, vm *virtv1alpha1.VirtualMachine) error {

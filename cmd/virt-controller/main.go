@@ -86,6 +86,7 @@ func main() {
 
 	mgr.GetWebhookServer().Register("/mutate-v1alpha1-virtualmachine", &webhook.Admission{Handler: &controller.VMMutator{}})
 	mgr.GetWebhookServer().Register("/validate-v1alpha1-virtualmachine", &webhook.Admission{Handler: &controller.VMValidator{}})
+	mgr.GetWebhookServer().Register("/validate-v1alpha1-virtualmachinemigration", &webhook.Admission{Handler: &controller.VMMValidator{Client: mgr.GetClient()}})
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")

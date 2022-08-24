@@ -167,6 +167,7 @@ type VirtualMachineStatus struct {
 	NodeName    string                         `json:"nodeName,omitempty"`
 	PowerAction VirtualMachinePowerAction      `json:"powerAction,omitempty"`
 	Migration   *VirtualMachineStatusMigration `json:"migration,omitempty"`
+	Conditions  []metav1.Condition             `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:validation:Enum=Pending;Scheduling;Scheduled;Running;Succeeded;Failed;Unknown
@@ -206,6 +207,12 @@ type VirtualMachineStatusMigration struct {
 	TargetVMPodName string                       `json:"targetVMPodName,omitempty"`
 	TargetVMPodUID  types.UID                    `json:"targetVMPodUID,omitempty"`
 }
+
+type VirtualMachineConditionType string
+
+const (
+	VirtualMachineMigratable VirtualMachineConditionType = "Migratable"
+)
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
