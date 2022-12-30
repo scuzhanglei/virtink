@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/client-go/tools/record"
+	cdiv1beta1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -1260,12 +1261,42 @@ func (r *VMReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}
 				requests := []reconcile.Request{}
 				for _, vm := range vmList.Items {
-					requests = append(requests, reconcile.Request{
-						NamespacedName: types.NamespacedName{
-							Namespace: vm.Namespace,
-							Name:      vm.Name,
-						},
-					})
+					for _, volume := range vm.Spec.Volumes {
+						if volume.PVCName() == obj.GetName() {
+							requests = append(requests, reconcile.Request{
+								NamespacedName: types.NamespacedName{
+									Namespace: vm.Namespace,
+									Name:      vm.Name,
+								},
+							})
+							break
+						}
+					}
+				}
+				return requests
+			})).
+		Watches(&source.Kind{Type: &cdiv1beta1.DataVolume{}},
+			handler.EnqueueRequestsFromMapFunc(func(obj client.Object) []reconcile.Request {
+				if _, ok := obj.(*cdiv1beta1.DataVolume); !ok {
+					return nil
+				}
+				var vmList virtv1alpha1.VirtualMachineList
+				if err := r.Client.List(context.Background(), &vmList, client.InNamespace(obj.GetNamespace())); err != nil {
+					return nil
+				}
+				requests := []reconcile.Request{}
+				for _, vm := range vmList.Items {
+					for _, volume := range vm.Spec.Volumes {
+						if volume.DataVolume != nil && volume.DataVolume.VolumeName == obj.GetName() {
+							requests = append(requests, reconcile.Request{
+								NamespacedName: types.NamespacedName{
+									Namespace: vm.Namespace,
+									Name:      vm.Name,
+								},
+							})
+							break
+						}
+					}
 				}
 				return requests
 			})).
